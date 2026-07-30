@@ -8,7 +8,7 @@ import secrets
 import string
 import sys
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -18,7 +18,7 @@ from .auth import AuthError, BrowserSession, bootstrap_browser_session
 from .client import HttpClient, redact
 from .config import collect_config, parse_args
 from .finalize import finalize_run
-from .query import QueryError, build_count_query, build_offset_query, execute_sync
+from .query import QueryError, build_offset_query, execute_sync
 from .session import SessionCoordinator, SessionSnapshot
 
 logger = logging.getLogger(__name__)
@@ -105,15 +105,15 @@ def _run_invariants(config: Any, sql: str, total_rows: int | None = None) -> dic
     return invariants
 
 
-def _validate_or_record_invariants(store: RunStore, config: Any, sql: str, total_rows: int) -> None:
-    expected = _run_invariants(config, sql, total_rows)
+def _validate_or_record_invariants(store: RunStore, config: Any, sql: str) -> None:
+    expected = _run_invariants(config, sql)
     manifest = store._read_manifest()
     existing = manifest.get("invariants", {})
     if not isinstance(existing, dict):
         raise ValueError("Manifest invariants tidak valid")
     for name, value in expected.items():
         if name in existing and existing[name] != value:
-            raise ValueError(f"Invariant {name!r} tidak cocok: lama={existing[name]!r} baru={value!r}")
+            raise ValueError(f"Invariant {name!r} tidak cocok")
     for name, value in expected.items():
         store.record_invariant(name, value)
 
@@ -136,69 +136,36 @@ def extract_run(
     client_factory: Any = None,
     run_store: RunStore | None = None,
 ) -> list[PageRecord]:
-    """Execute missing synchronous pages and retain auditable page artifacts."""
+    """Fetch bounded page batches until an empty page, reusing valid artifacts."""
     store = run_store or RunStore.create(config.artifacts_dir, sql)
     make_client = client_factory or _client_for_snapshot(config)
-    store.append_event({"event": "run_started"})
-    started = time.monotonic()
-    try:
-        count_state = _execute_with_refresh(config, coordinator, make_client, build_count_query(sql), stage="count")
-    except BaseException as error:
-        store.record_run_failure("count", error)
-        raise
-    total_rows = _total_rows(count_state)
-    _validate_or_record_invariants(store, config, sql, total_rows)
-    offsets = range(0, total_rows, config.page_size)
-    total_pages = len(range(0, total_rows, config.page_size))
+    store.append_event({"event": "run_started", "pagination": "until-empty"})
+    _validate_or_record_invariants(store, config, sql)
     records: list[PageRecord] = []
-    gaps: list[int] = []
-    for offset in offsets:
-        record = store.validate_page_record(offset)
-        if record is None:
-            gaps.append(offset)
-        else:
-            records.append(record)
-    store.append_event({"event": "count_completed", "rows": total_rows, "elapsed_ms": int((time.monotonic() - started) * 1000), "completed": len(records), "total": total_rows})
-    logger.info("event=count_completed rows=%d total_pages=%d elapsed_ms=%d", total_rows, total_pages, int((time.monotonic() - started) * 1000))
-    with ThreadPoolExecutor(max_workers=config.workers) as executor:
-        pending = iter(gaps)
-        futures: dict[Future[list[dict[str, Any]]], tuple[int, float]] = {}
-        last_page_started_at: float | None = None
-
-        def start_next_page() -> bool:
-            nonlocal last_page_started_at
-            try:
-                offset = next(pending)
-            except StopIteration:
-                return False
-            page_started = _wait_for_page_slot(last_page_started_at)
-            last_page_started_at = page_started
-            store.append_event({"event": "page_started", "offset": offset, "attempt": 1, "completed": len(records), "total": total_rows})
-            logger.info("event=page_started offset=%d limit=%d completed=%d total_pages=%d", offset, config.page_size, len(records), total_pages)
-            futures[executor.submit(_fetch_sync_page, offset, config, sql, coordinator, make_client)] = (offset, page_started)
-            return True
-
-        for _ in range(min(config.workers, len(gaps))):
-            start_next_page()
-        while futures:
-            completed, _ = wait(futures, return_when=FIRST_COMPLETED)
-            for future in completed:
-                offset, page_started = futures.pop(future)
-                try:
-                    rows = future.result()
-                    record = store.write_page(offset, rows)
-                except BaseException as error:
-                    store.record_failure(offset, 1, error)
-                    raise
-                records.append(record)
-                store.append_event({"event": "page_completed", "offset": offset, "rows": record.rows, "attempt": 1, "elapsed_ms": int((time.monotonic() - page_started) * 1000), "completed": len(records), "total": total_rows})
-                logger.info("event=page_completed offset=%d rows=%d elapsed_ms=%d completed=%d total_pages=%d", offset, record.rows, int((time.monotonic() - page_started) * 1000), len(records), total_pages)
-                start_next_page()
-    expected_offsets = tuple(offsets)
-    valid_records = {record.offset: record for record in records}
-    if len(valid_records) != len(expected_offsets) or any(offset not in valid_records or store.validate_page_record(offset) is None for offset in expected_offsets):
-        raise RuntimeError("Ekstraksi memiliki halaman yang belum lengkap")
-    return sorted(records, key=lambda record: record.offset)
+    offset = 0
+    terminal_offset: int | None = None
+    while terminal_offset is None:
+        offsets = [offset + index * config.page_size for index in range(config.workers)]
+        with ThreadPoolExecutor(max_workers=config.workers) as executor:
+            futures = {candidate: executor.submit(_fetch_sync_page, candidate, config, sql, coordinator, make_client) for candidate in offsets}
+            for candidate in offsets:
+                existing = store.validate_page_record(candidate)
+                if existing is not None:
+                    record = existing
+                else:
+                    try:
+                        record = store.write_page(candidate, futures[candidate].result())
+                    except BaseException as error:
+                        store.record_failure(candidate, 1, error)
+                        raise
+                if terminal_offset is None:
+                    records.append(record)
+                if record.rows == 0 and terminal_offset is None:
+                    terminal_offset = candidate
+        if terminal_offset is None:
+            offset += config.workers * config.page_size
+    store.record_invariant("terminal_offset", terminal_offset)
+    return sorted((record for record in records if record.offset <= terminal_offset), key=lambda record: record.offset)
 
 
 def _fetch_sync_page(offset: int, config: Any, sql: str, coordinator: SessionCoordinator, make_client: Any) -> list[dict[str, Any]]:
