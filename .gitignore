@@ -1,0 +1,60 @@
+# Reference project and exploratory extraction scripts (local only)
+bpsktt/
+more.txt
+numbered.txt
+run_more.py
+run_num.py
+run_csv.py
+run_plain.py
+run_final.py
+final_report.txt
+plain_report.txt
+report.csv
+gen_report.py
+query.sql
+har_*.txt
+har_out*.txt
+results_report.md
+
+# Run artifacts and logs (local-first, never commit)
+artifacts/
+artifacts/session/profile/
+*.log
+logs/
+
+# Local secrets and authentication state
+.env
+.env.*
+!.env.example
+.sql-lab-profile/
+**/.sql-lab-profile/
+SQL_LAB_BROWSER_PROFILE_DIR/
+
+# Browser diagnostics and temporary session artifacts
+sql_lab_browser.log
+sql_lab_browser.log.*
+*.trace.zip
+*.har
+*.partial
+*.partial.*
+*.xlsx
+*.parquet
+*.db
+*.sqlite
+*.sqlite3
+*.zip
+*.bak
+HTTPToolkit_*.har
+sqllab_*.xlsx
+report*.csv
+*_report.txt
+har_*.py
+
+# Local extraction outputs
+*.csv
+*.jsonl
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
