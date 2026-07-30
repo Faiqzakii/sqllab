@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import os
 import tempfile
@@ -81,18 +80,13 @@ def _validate_records(run_store: RunStore, records: Iterable[PageRecord]) -> tup
         manifest_record = run_store._manifest_page_record(record.offset)
         if manifest_record != record:
             raise ValueError("Rekaman halaman tidak cocok dengan manifest")
+        rows = run_store.load_valid_page(record.offset)
+        if rows is None:
+            raise ValueError("Halaman tidak valid")
+        if len(rows) != record.rows:
+            raise ValueError("Jumlah baris halaman tidak valid")
         if record.columns != columns:
             raise ValueError("Schema drift terdeteksi antar halaman")
-        page_path = run_store.run_dir / "pages" / f"offset-{record.offset}.csv"
-        if not page_path.is_file() or _checksum(page_path) != record.checksum:
-            raise ValueError("Halaman CSV tidak valid")
-        with page_path.open("r", encoding="utf-8", newline="") as page:
-            reader = csv.DictReader(page)
-            if tuple(reader.fieldnames or ()) != columns:
-                raise ValueError("Schema drift terdeteksi antar halaman")
-            row_count = sum(1 for row in reader if tuple(row) and set(row) == set(columns))
-            if row_count != record.rows:
-                raise ValueError("Halaman CSV tidak valid")
     return columns
 
 
@@ -118,21 +112,21 @@ def _write_parquet(
     try:
         with parquet.ParquetWriter(temporary, schema) as writer:
             for record in records:
-                page_path = run_store.run_dir / "pages" / f"offset-{record.offset}.csv"
-                with page_path.open("r", encoding="utf-8", newline="") as page:
-                    reader = csv.DictReader(page)
-                    batch: list[dict[str, str]] = []
-                    for row in reader:
-                        if set(row) != set(columns):
-                            raise ValueError("Schema drift terdeteksi antar halaman")
-                        batch.append(row)
-                        if len(batch) == PARQUET_BATCH_SIZE:
-                            writer.write_table(pa.Table.from_pylist(batch, schema=schema))
-                            total_rows += len(batch)
-                            batch.clear()
-                    if batch:
+                rows = run_store.load_valid_page(record.offset)
+                if rows is None:
+                    raise ValueError("Halaman tidak valid")
+                batch: list[dict[str, str | None]] = []
+                for row in rows:
+                    if set(row) != set(columns):
+                        raise ValueError("Schema drift terdeteksi antar halaman")
+                    batch.append({column: None if row[column] is None else str(row[column]) for column in columns})
+                    if len(batch) == PARQUET_BATCH_SIZE:
                         writer.write_table(pa.Table.from_pylist(batch, schema=schema))
                         total_rows += len(batch)
+                        batch.clear()
+                if batch:
+                    writer.write_table(pa.Table.from_pylist(batch, schema=schema))
+                    total_rows += len(batch)
         os.replace(temporary, target)
     except BaseException:
         temporary.unlink(missing_ok=True)

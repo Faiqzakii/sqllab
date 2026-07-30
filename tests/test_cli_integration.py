@@ -44,18 +44,18 @@ class ResumeStatusBehaviorTests(unittest.TestCase):
         store = Mock()
         first_record = PageRecord(0, 1000, ("assignment_id",), "a" * 64)
         missing_record = PageRecord(1000, 1, ("assignment_id",), "b" * 64)
-        store.validate_page_record.side_effect = [first_record, None, first_record, missing_record]
+        empty_record = PageRecord(2000, 0, ("assignment_id",), "c" * 64)
+        store.validate_page_record.side_effect = [first_record, None, empty_record]
         store._read_manifest.return_value = {"invariants": {}}
         store.write_page.return_value = missing_record
-        count_state = SimpleNamespace(data=[{"total_rows": 1001}])
         with (
-            patch("sql_lab_extractor.__main__._execute_with_refresh", return_value=count_state),
             patch("sql_lab_extractor.__main__._fetch_sync_page", return_value=[{"assignment_id": "2"}]) as fetch,
+            patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0),
         ):
             records = extract_run(config, "SELECT assignment_id FROM sample ORDER BY assignment_id", Mock(), client_factory=Mock(), run_store=store)
 
         self.assertEqual(records, [first_record, missing_record])
-        self.assertEqual(store.validate_page_record.call_args_list, [unittest.mock.call(0), unittest.mock.call(1000), unittest.mock.call(0), unittest.mock.call(1000)])
+        self.assertEqual(store.validate_page_record.call_args_list, [unittest.mock.call(0), unittest.mock.call(1000), unittest.mock.call(2000)])
         fetch.assert_called_once_with(1000, config, "SELECT assignment_id FROM sample ORDER BY assignment_id", unittest.mock.ANY, unittest.mock.ANY)
 
     def test_resume_rejects_invariant_drift_before_page_reuse(self):

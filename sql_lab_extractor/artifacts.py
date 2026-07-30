@@ -14,6 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+import pyarrow as pa
+import pyarrow.parquet as parquet
+
 from .client import HttpResponseError, HttpStatusError, HttpTimeoutError, redact
 
 logger = logging.getLogger(__name__)
@@ -29,7 +32,7 @@ class PageRecord:
 
 
 class RunStore:
-    """Per-run artifact store with atomic page CSV files and append-only progress."""
+    """Per-run atomic Parquet page store with legacy CSV resume support."""
 
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
@@ -79,70 +82,68 @@ class RunStore:
                 os.fsync(progress.fileno())
 
     def write_page(self, offset: int, rows: Iterable[dict[str, object]]) -> PageRecord:
-        """Write one schema-validated page CSV atomically and return its checksum record."""
+        """Write one schema-validated Parquet page atomically."""
         if offset < 0:
             raise ValueError("Offset halaman wajib non-negatif")
-        iterator = iter(rows)
-        try:
-            first_row = next(iterator)
-        except StopIteration:
-            first_row = None
+        materialized = list(rows)
+        first_row = materialized[0] if materialized else None
         columns = self._page_columns(first_row)
         expected = set(columns)
+        for row in materialized:
+            if set(row) != expected:
+                raise ValueError("Schema drift terdeteksi dalam satu halaman")
         target = self._page_path(offset)
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".partial", dir=self._pages_dir)
+        os.close(descriptor)
         temporary = Path(temporary_name)
-        checksum = hashlib.sha256()
-        row_count = 0
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as page:
-                hashing = _HashingWriter(page, checksum)
-                writer = csv.DictWriter(hashing, fieldnames=columns)
-                writer.writeheader()
-                for row in (() if first_row is None else (first_row,)):
-                    writer.writerow(row)
-                    row_count += 1
-                for row in iterator:
-                    if set(row) != expected:
-                        raise ValueError("Schema drift terdeteksi dalam satu halaman")
-                    writer.writerow(row)
-                    row_count += 1
-                page.flush()
-                os.fsync(page.fileno())
+            schema = pa.schema([pa.field(column, pa.string()) for column in columns])
+            table = pa.Table.from_pylist([{column: None if row.get(column) is None else str(row[column]) for column in columns} for row in materialized], schema=schema)
+            parquet.write_table(table, temporary)
             os.replace(temporary, target)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
-        record = PageRecord(offset=offset, rows=row_count, columns=columns, checksum=checksum.hexdigest())
+        record = PageRecord(offset=offset, rows=len(materialized), columns=columns, checksum=_checksum_file(target))
         self._record_page_in_manifest(record)
         return record
 
     def validate_page_record(self, offset: int) -> PageRecord | None:
-        """Return a page record only when its CSV validates without materializing rows."""
-        target = self._page_path(offset)
-        if not target.is_file():
-            return None
+        """Validate current Parquet pages and legacy CSV pages."""
         record = self._manifest_page_record(offset)
         if record is None:
             return None
-        checksum = hashlib.sha256()
+        target = self._page_path(offset)
+        legacy = self._legacy_page_path(offset)
         try:
-            with target.open("rb") as page:
-                for chunk in iter(lambda: page.read(1024 * 1024), b""):
-                    checksum.update(chunk)
-            if checksum.hexdigest() != record.checksum:
-                return None
-            with target.open("r", encoding="utf-8", newline="") as page:
-                reader = csv.reader(page)
-                if tuple(next(reader, ())) != record.columns:
+            if target.is_file():
+                if _checksum_file(target) != record.checksum:
                     return None
-                if any(len(row) != len(record.columns) for row in reader):
+                table = parquet.read_table(target)
+                if tuple(table.column_names) != record.columns or table.num_rows != record.rows:
                     return None
-                if reader.line_num != record.rows + 1:
+                return record
+            if legacy.is_file():
+                if _checksum_file(legacy) != record.checksum:
                     return None
-        except (OSError, csv.Error):
+                with legacy.open("r", encoding="utf-8", newline="") as page:
+                    reader = csv.reader(page)
+                    if tuple(next(reader, ())) != record.columns or sum(1 for _ in reader) != record.rows:
+                        return None
+                return record
+        except (OSError, csv.Error, ValueError, pa.ArrowException):
             return None
-        return record
+        return None
+
+    def load_valid_page(self, offset: int) -> list[dict[str, object]] | None:
+        record = self.validate_page_record(offset)
+        if record is None:
+            return None
+        target = self._page_path(offset)
+        if target.is_file():
+            return parquet.read_table(target).to_pylist()
+        with self._legacy_page_path(offset).open("r", encoding="utf-8", newline="") as page:
+            return list(csv.DictReader(page))
 
     def set_status(self, status: str) -> None:
         """Atomically update the run status without discarding manifest fields."""
@@ -162,13 +163,6 @@ class RunStore:
             invariants[name] = value
             self._write_json_atomic(self._manifest_path, manifest)
 
-    def load_valid_page(self, offset: int) -> list[dict[str, object]] | None:
-        """Return page rows only when checksum, schema, and row count validate."""
-        record = self.validate_page_record(offset)
-        if record is None:
-            return None
-        with self._page_path(offset).open("r", encoding="utf-8", newline="") as page:
-            return list(csv.DictReader(page))
 
 
     def record_failure(self, offset: int, attempt: int, error: object) -> None:
@@ -206,7 +200,11 @@ class RunStore:
         self.append_event({"event": "run_failed", "stage": stage, "error_type": sanitized["type"]})
 
     def _page_path(self, offset: int) -> Path:
+        return self._pages_dir / f"offset-{offset}.parquet"
+
+    def _legacy_page_path(self, offset: int) -> Path:
         return self._pages_dir / f"offset-{offset}.csv"
+
 
     @staticmethod
     def _page_columns(first_row: dict[str, object] | None) -> tuple[str, ...]:
@@ -249,6 +247,7 @@ class RunStore:
         with self._manifest_lock:
             manifest = self._read_manifest()
             manifest.setdefault("pages", {})[str(record.offset)] = {
+                "format": "parquet",
                 "rows": record.rows,
                 "columns": list(record.columns),
                 "checksum": record.checksum,
@@ -300,3 +299,10 @@ def _sanitize_failure(error: object) -> dict[str, object]:
         "category": "failure",
         "message": "error recorded",
     }
+
+def _checksum_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()

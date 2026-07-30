@@ -8,14 +8,14 @@ import secrets
 import string
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
 from .artifacts import PageRecord, RunStore
 from .auth import AuthError, BrowserSession, bootstrap_browser_session
-from .client import HttpClient, redact
+from .client import HttpClient, HttpStatusError, redact
 from .config import collect_config, parse_args
 from .finalize import finalize_run
 from .query import QueryError, build_offset_query, execute_sync
@@ -136,36 +136,110 @@ def extract_run(
     client_factory: Any = None,
     run_store: RunStore | None = None,
 ) -> list[PageRecord]:
-    """Fetch bounded page batches until an empty page, reusing valid artifacts."""
+    """Keep a bounded request window until consecutive empty pages confirm terminal."""
     store = run_store or RunStore.create(config.artifacts_dir, sql)
     make_client = client_factory or _client_for_snapshot(config)
-    store.append_event({"event": "run_started", "pagination": "until-empty"})
+    page_size = config.page_size
+    store.append_event({"event": "run_started", "pagination": "sliding-until-empty"})
     _validate_or_record_invariants(store, config, sql)
-    records: list[PageRecord] = []
-    offset = 0
+    started = time.monotonic()
+    records: dict[int, PageRecord] = {}
+    outcomes: dict[int, str] = {}
+    failed_offsets: set[int] = set()
+    next_offset = 0
+    evaluation_offset = 0
+    empty_streak = 0
     terminal_offset: int | None = None
-    while terminal_offset is None:
-        offsets = [offset + index * config.page_size for index in range(config.workers)]
-        with ThreadPoolExecutor(max_workers=config.workers) as executor:
-            futures = {candidate: executor.submit(_fetch_sync_page, candidate, config, sql, coordinator, make_client) for candidate in offsets}
-            for candidate in offsets:
-                existing = store.validate_page_record(candidate)
+    last_page_started_at: float | None = None
+    consecutive_failures = 0
+    last_error: BaseException | None = None
+    fatal_error: BaseException | None = None
+
+    with ThreadPoolExecutor(max_workers=config.workers) as executor:
+        active: dict[Future[list[dict[str, Any]]], tuple[int, float]] = {}
+        while terminal_offset is None:
+            while len(active) < config.workers and consecutive_failures == 0 and fatal_error is None:
+                existing = store.validate_page_record(next_offset)
                 if existing is not None:
-                    record = existing
-                else:
-                    try:
-                        record = store.write_page(candidate, futures[candidate].result())
-                    except BaseException as error:
-                        store.record_failure(candidate, 1, error)
-                        raise
-                if terminal_offset is None:
-                    records.append(record)
-                if record.rows == 0 and terminal_offset is None:
-                    terminal_offset = candidate
-        if terminal_offset is None:
-            offset += config.workers * config.page_size
+                    records[next_offset] = existing
+                    outcomes[next_offset] = "empty" if existing.rows == 0 else "data"
+                    store.append_event({"event": "page_reused", "offset": next_offset, "rows": existing.rows})
+                    next_offset += page_size
+                    while evaluation_offset in outcomes:
+                        outcome = outcomes[evaluation_offset]
+                        empty_streak = empty_streak + 1 if outcome == "empty" else 0
+                        evaluation_offset += page_size
+                        if empty_streak == config.workers:
+                            terminal_offset = evaluation_offset - config.workers * page_size
+                            break
+                    if terminal_offset is not None:
+                        break
+                    continue
+                page_started = _wait_for_page_slot(last_page_started_at)
+                last_page_started_at = page_started
+                store.append_event({"event": "page_started", "offset": next_offset, "attempt": 1})
+                future = executor.submit(_fetch_sync_page, next_offset, config, sql, coordinator, make_client)
+                active[future] = (next_offset, page_started)
+                next_offset += page_size
+            done, _ = wait(active, return_when=FIRST_COMPLETED)
+            for future in done:
+                candidate, page_started = active.pop(future)
+                try:
+                    rows = future.result()
+                except BaseException as error:
+                    failed_offsets.add(candidate)
+                    outcomes[candidate] = "failed"
+                    store.record_failure(candidate, 1, error)
+                    consecutive_failures += 1
+                    last_error = error
+                    if isinstance(error, HttpStatusError) and error.status_code == 429:
+                        fatal_error = error
+                        store.append_event({"event": "run_rate_limited", "offset": candidate, "status_code": 429})
+                        for pending in active:
+                            pending.cancel()
+                        break
+                    continue
+                consecutive_failures = 0
+                record = store.write_page(candidate, rows)
+                records[candidate] = record
+                outcomes[candidate] = "empty" if record.rows == 0 else "data"
+                event = "page_empty" if record.rows == 0 else "page_completed"
+                store.append_event({"event": event, "offset": candidate, "rows": record.rows, "attempt": 1, "elapsed_ms": int((time.monotonic() - page_started) * 1000)})
+            if fatal_error is not None:
+                raise fatal_error
+            while evaluation_offset in outcomes:
+                outcome = outcomes[evaluation_offset]
+                empty_streak = empty_streak + 1 if outcome == "empty" else 0
+                evaluation_offset += page_size
+                if empty_streak == config.workers:
+                    terminal_offset = evaluation_offset - config.workers * page_size
+                    break
+            if consecutive_failures >= config.workers and last_error is not None:
+                raise last_error
+
+    retry_offsets = sorted(candidate for candidate in failed_offsets if candidate < terminal_offset)
+    for candidate in retry_offsets:
+        store.append_event({"event": "page_retry_started", "offset": candidate, "attempt": 2})
+        try:
+            record = store.write_page(candidate, _fetch_sync_page(candidate, config, sql, coordinator, make_client))
+        except BaseException as error:
+            store.record_failure(candidate, 2, error)
+            continue
+        records[candidate] = record
+        failed_offsets.remove(candidate)
+        store.append_event({"event": "page_completed", "offset": candidate, "rows": record.rows, "attempt": 2})
+
+    expected_offsets = tuple(range(0, terminal_offset, page_size))
+    missing_offsets = [candidate for candidate in expected_offsets if candidate not in records or records[candidate].rows == 0]
+    if missing_offsets:
+        store.append_event({"event": "run_incomplete", "missing_offsets": missing_offsets})
+        raise RuntimeError(f"Ekstraksi belum lengkap; ulangi run untuk {len(missing_offsets)} offset gagal atau hilang")
     store.record_invariant("terminal_offset", terminal_offset)
-    return sorted((record for record in records if record.offset <= terminal_offset), key=lambda record: record.offset)
+    store.append_event({"event": "terminal_confirmed", "offset": terminal_offset, "empty_pages": config.workers})
+    result = [records[candidate] for candidate in expected_offsets]
+    total_rows = sum(record.rows for record in result)
+    store.append_event({"event": "pages_completed", "rows": total_rows, "pages": len(result), "elapsed_ms": int((time.monotonic() - started) * 1000)})
+    return result
 
 
 def _fetch_sync_page(offset: int, config: Any, sql: str, coordinator: SessionCoordinator, make_client: Any) -> list[dict[str, Any]]:
@@ -180,15 +254,6 @@ def _execute_with_refresh(config: Any, coordinator: SessionCoordinator, make_cli
     snapshot = coordinator.get_snapshot()
     payload = build_execute_payload(config, sql)
     return execute_sync(make_client(snapshot), payload, stage=stage)
-
-
-def _total_rows(state: Any) -> int:
-    if not state.data or "total_rows" not in state.data[0]:
-        raise QueryError("Hasil COUNT(*) tidak valid")
-    try:
-        return int(state.data[0]["total_rows"])
-    except (TypeError, ValueError) as error:
-        raise QueryError("Hasil COUNT(*) bukan angka") from error
 
 
 def _client_for_snapshot(config: Any):

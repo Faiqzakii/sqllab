@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sql_lab_extractor.__main__ import extract_run
 from sql_lab_extractor.auth import BrowserSession
@@ -19,12 +20,12 @@ class SynchronousExtractionTests(unittest.TestCase):
         class Client:
             def request(self, method, path, payload=None):
                 sql = payload["sql"]
-                if "COUNT(1)" in sql:
-                    return {"status": "success", "data": [{"total_rows": 5}]}
                 offset = int(re.search(r"OFFSET (\d+)$", sql).group(1))
+                if offset >= 5:
+                    return {"status": "success", "data": []}
                 return {"status": "success", "data": [{"assignment_id": str(offset)}]}
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0):
             config = parse_args([
                 "--sql-file", "q.sql", "--page-size", "2", "--workers", "2",
                 "--artifacts-dir", directory,
@@ -49,18 +50,18 @@ class SynchronousExtractionTests(unittest.TestCase):
             def request(self, method, path, payload=None):
                 nonlocal active, highest_active
                 sql = payload["sql"]
-                if "COUNT(1)" in sql:
-                    return {"status": "success", "data": [{"total_rows": 5}]}
                 active += 1
                 highest_active = max(highest_active, active)
                 try:
                     time.sleep(0.01)
                     offset = int(re.search(r"OFFSET (\d+)$", sql).group(1))
+                    if offset >= 5:
+                        return {"status": "success", "data": []}
                     return {"status": "success", "data": [{"assignment_id": str(offset)}]}
                 finally:
                     active -= 1
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0):
             config = parse_args(["--sql-file", "q.sql", "--page-size", "1", "--workers", "2", "--artifacts-dir", directory])
             coordinator = SessionCoordinator(refresh=lambda: BrowserSession("cookie", "csrf"))
             extract_run(config, "SELECT assignment_id FROM sample ORDER BY assignment_id", coordinator, client_factory=lambda snapshot: Client())
@@ -118,8 +119,6 @@ class SynchronousExtractionTests(unittest.TestCase):
             def request(self, method, path, payload=None):
                 sql = payload["sql"]
                 calls.append((self.generation, sql))
-                if "COUNT(1)" in sql:
-                    return {"status": "success", "data": [{"total_rows": 1}]}
                 raise HttpStatusError(401)
 
         with tempfile.TemporaryDirectory() as directory:
@@ -132,8 +131,29 @@ class SynchronousExtractionTests(unittest.TestCase):
                     coordinator,
                     client_factory=lambda snapshot: Client(snapshot.generation),
                 )
-        self.assertEqual([generation for generation, sql in calls if "OFFSET" in sql], [1])
+        self.assertEqual([generation for generation, sql in calls if "OFFSET" in sql], [1, 1])
         self.assertEqual(coordinator.get_snapshot().generation, 1)
+
+    def test_stops_scheduling_after_rate_limit(self):
+        offsets = []
+
+        class Client:
+            def request(self, method, path, payload=None):
+                offset = int(re.search(r"OFFSET (\d+)$", payload["sql"]).group(1))
+                offsets.append(offset)
+                if offset == 0:
+                    time.sleep(0.05)
+                    return {"status": "success", "data": [{"assignment_id": "0"}]}
+                raise HttpStatusError(429)
+
+        with tempfile.TemporaryDirectory() as directory, patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0):
+            config = parse_args(["--sql-file", "q.sql", "--page-size", "1000", "--workers", "2", "--artifacts-dir", directory])
+            coordinator = SessionCoordinator(refresh=lambda: BrowserSession("cookie", "csrf"))
+            with self.assertRaises(HttpStatusError) as caught:
+                extract_run(config, "SELECT assignment_id FROM sample ORDER BY assignment_id", coordinator, client_factory=lambda snapshot: Client())
+
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertEqual(sorted(offsets), [0, 1000])
 
     def test_does_not_retry_ambiguous_execute_timeout(self):
         class Client:
@@ -142,8 +162,6 @@ class SynchronousExtractionTests(unittest.TestCase):
 
             def request(self, method, path, payload=None):
                 self.calls += 1
-                if "COUNT(1)" in payload["sql"]:
-                    return {"status": "success", "data": [{"total_rows": 1}]}
                 raise RuntimeError("HTTP request timed out; execute was not retried")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -158,6 +176,33 @@ class SynchronousExtractionTests(unittest.TestCase):
                     client_factory=lambda snapshot: client,
                 )
         self.assertEqual(client.calls, 2)
+
+    def test_continues_after_timeout_then_retries_before_finalizing(self):
+        from collections import defaultdict
+        from unittest.mock import patch
+
+        attempts = defaultdict(int)
+
+        def fetch(offset, config, sql, coordinator, make_client):
+            attempts[offset] += 1
+            if offset == 0 and attempts[offset] == 1:
+                raise RuntimeError("timed out")
+            if offset < 2:
+                return [{"assignment_id": str(offset)}]
+            return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = parse_args(["--sql-file", "q.sql", "--page-size", "1", "--workers", "2", "--artifacts-dir", directory])
+            coordinator = SessionCoordinator(refresh=lambda: BrowserSession("cookie", "csrf"))
+            with (
+                patch("sql_lab_extractor.__main__._fetch_sync_page", side_effect=fetch),
+                patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0),
+            ):
+                records = extract_run(config, "SELECT assignment_id FROM sample ORDER BY assignment_id", coordinator)
+
+        self.assertEqual([record.offset for record in records], [0, 1])
+        self.assertEqual(attempts[0], 2)
+        self.assertGreaterEqual(attempts[3], 1)
 
 
 if __name__ == "__main__":

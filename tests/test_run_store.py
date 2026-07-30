@@ -1,5 +1,7 @@
 import json
 import re
+import csv
+import hashlib
 import threading
 import unittest
 from pathlib import Path
@@ -60,8 +62,8 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(store.validate_page_record(0), record)
             self.assertIsNone(store.validate_page_record(1000))
 
-            page = store.run_dir / "pages" / "offset-0.csv"
-            page.write_bytes(page.read_bytes() + b"corrupt,row\n")
+            page = store.run_dir / "pages" / "offset-0.parquet"
+            page.write_bytes(page.read_bytes() + b"corrupt")
             self.assertIsNone(store.validate_page_record(0))
 
     def test_concurrent_write_page_manifest_entries_all_survive(self):
@@ -117,7 +119,7 @@ class RunStoreTests(unittest.TestCase):
                 event = json.loads(line)
                 self.assertEqual(event["event"], "tick")
 
-    def test_write_page_creates_atomic_csv_and_returns_record(self):
+    def test_write_page_creates_atomic_parquet_and_returns_record(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = RunStore.create(root, "SELECT 1")
@@ -128,9 +130,8 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(record.rows, 2)
             self.assertEqual(record.columns, ("id", "name"))
             self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", record.checksum))
-            page = store.run_dir / "pages" / "offset-0.csv"
+            page = store.run_dir / "pages" / "offset-0.parquet"
             self.assertTrue(page.is_file())
-            self.assertEqual(page.read_text(encoding="utf-8").splitlines()[0], "id,name")
             self.assertEqual(list(root.rglob("*.partial")), [])
 
     def test_write_page_rejects_schema_drift_within_page(self):
@@ -139,7 +140,7 @@ class RunStoreTests(unittest.TestCase):
             store = RunStore.create(root, "SELECT 1")
             with self.assertRaises(ValueError):
                 store.write_page(0, [{"id": 1}, {"id": 2, "extra": "drift"}])
-            self.assertFalse((store.run_dir / "pages" / "offset-0.csv").exists())
+            self.assertFalse((store.run_dir / "pages" / "offset-0.parquet").exists())
             self.assertEqual(list(root.rglob("*.partial")), [])
 
     def test_load_valid_page_round_trips_rows(self):
@@ -155,14 +156,27 @@ class RunStoreTests(unittest.TestCase):
             store = RunStore.create(root, "SELECT 1")
             self.assertIsNone(store.load_valid_page(500))
             store.write_page(0, [{"id": "1", "name": "alpha"}])
-            page = store.run_dir / "pages" / "offset-0.csv"
+            page = store.run_dir / "pages" / "offset-0.parquet"
             original = page.read_bytes()
-            page.write_bytes(original + b"corrupt,row\n")
+            page.write_bytes(original + b"corrupt")
             self.assertIsNone(store.load_valid_page(0))
             page.write_bytes(original)
             self.assertIsNotNone(store.load_valid_page(0))
-            page.write_text("other,name\n1,alpha\n", encoding="utf-8")
+            page.write_bytes(b"not parquet")
             self.assertIsNone(store.load_valid_page(0))
+
+    def test_loads_legacy_csv_page_for_resume(self):
+        with TemporaryDirectory() as temporary:
+            store = RunStore.create(Path(temporary), "SELECT 1")
+            page = store.run_dir / "pages" / "offset-0.csv"
+            with page.open("w", encoding="utf-8", newline="") as output:
+                writer = csv.DictWriter(output, fieldnames=("id", "name"))
+                writer.writeheader()
+                writer.writerow({"id": "1", "name": "a,b"})
+            checksum = hashlib.sha256(page.read_bytes()).hexdigest()
+            store._record_page_in_manifest(PageRecord(0, 1, ("id", "name"), checksum))
+
+            self.assertEqual(store.load_valid_page(0), [{"id": "1", "name": "a,b"}])
 
     def test_record_failure_stores_only_type_category_and_fixed_message(self):
         with TemporaryDirectory() as temporary:
