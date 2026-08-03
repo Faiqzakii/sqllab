@@ -155,6 +155,27 @@ class SynchronousExtractionTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 429)
         self.assertEqual(sorted(offsets), [0, 1000])
 
+    def test_pauses_refill_after_empty_page_until_window_resolves(self):
+        offsets = []
+
+        def fetch(offset, config, sql, coordinator, make_client):
+            offsets.append(offset)
+            if offset == 0:
+                time.sleep(0.05)
+            return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = parse_args(["--sql-file", "q.sql", "--page-size", "1000", "--workers", "5", "--artifacts-dir", directory])
+            coordinator = SessionCoordinator(refresh=lambda: BrowserSession("cookie", "csrf"))
+            with (
+                patch("sql_lab_extractor.__main__._fetch_sync_page", side_effect=fetch),
+                patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0),
+            ):
+                records = extract_run(config, "SELECT assignment_id FROM sample ORDER BY assignment_id", coordinator)
+
+        self.assertEqual(records, [])
+        self.assertEqual(sorted(offsets), [0, 1000, 2000, 3000, 4000])
+
     def test_does_not_retry_ambiguous_execute_timeout(self):
         class Client:
             def __init__(self):

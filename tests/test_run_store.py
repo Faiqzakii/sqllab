@@ -54,6 +54,22 @@ class RunStoreTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "running")
             self.assertEqual(manifest["invariants"], {"page_size": 1000})
 
+    def test_records_non_secret_resume_configuration(self):
+        from types import SimpleNamespace
+
+        with TemporaryDirectory() as temporary:
+            store = RunStore.create(Path(temporary), "SELECT 1")
+            store.record_config(SimpleNamespace(
+                base_url="https://example.test", database_id=9, schema="sample", page_size=500,
+                query_limit=50000, sql_editor_id="77", tab="Stored", workers=3,
+                final_formats=("parquet",),
+            ))
+            manifest = json.loads((store.run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["config"]["workers"], 3)
+        self.assertNotIn("cookie", manifest["config"])
+        self.assertNotIn("csrf", manifest["config"])
+
     def test_validate_page_record_checks_page_without_loading_rows(self):
         with TemporaryDirectory() as temporary:
             store = RunStore.create(Path(temporary), "SELECT 1")

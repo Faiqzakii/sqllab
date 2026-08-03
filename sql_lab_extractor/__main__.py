@@ -43,6 +43,7 @@ def main(arguments: list[str] | None = None) -> int:
     try:
         sql = config.sql_file.read_text(encoding="utf-8")
         store = _select_store(config, sql)
+        store.record_config(config)
         run_handler = _attach_run_log(store.run_dir)
         store.set_status("running")
         session_dir = Path(config.artifacts_dir) / "session"
@@ -154,11 +155,12 @@ def extract_run(
     consecutive_failures = 0
     last_error: BaseException | None = None
     fatal_error: BaseException | None = None
+    empty_probe_active = False
 
     with ThreadPoolExecutor(max_workers=config.workers) as executor:
         active: dict[Future[list[dict[str, Any]]], tuple[int, float]] = {}
         while terminal_offset is None:
-            while len(active) < config.workers and consecutive_failures == 0 and fatal_error is None:
+            while len(active) < config.workers and consecutive_failures == 0 and fatal_error is None and not empty_probe_active:
                 existing = store.validate_page_record(next_offset)
                 if existing is not None:
                     records[next_offset] = existing
@@ -203,6 +205,8 @@ def extract_run(
                 record = store.write_page(candidate, rows)
                 records[candidate] = record
                 outcomes[candidate] = "empty" if record.rows == 0 else "data"
+                if record.rows == 0:
+                    empty_probe_active = True
                 event = "page_empty" if record.rows == 0 else "page_completed"
                 store.append_event({"event": event, "offset": candidate, "rows": record.rows, "attempt": 1, "elapsed_ms": int((time.monotonic() - page_started) * 1000)})
             if fatal_error is not None:
@@ -214,6 +218,8 @@ def extract_run(
                 if empty_streak == config.workers:
                     terminal_offset = evaluation_offset - config.workers * page_size
                     break
+            if empty_probe_active and not active and terminal_offset is None:
+                empty_probe_active = False
             if consecutive_failures >= config.workers and last_error is not None:
                 raise last_error
 

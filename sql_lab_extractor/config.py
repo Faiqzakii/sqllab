@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -39,25 +40,52 @@ class Config:
 
 def parse_args(arguments: list[str] | None = None) -> Config | None:
     parser = argparse.ArgumentParser(description="Authorized SQL Lab extractor")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
-    parser.add_argument("--database-id", default=DEFAULT_DATABASE_ID, type=int)
-    parser.add_argument("--schema", default=DEFAULT_SCHEMA)
+    parser.add_argument("--base-url")
+    parser.add_argument("--database-id", type=int)
+    parser.add_argument("--schema")
     parser.add_argument("--sql-file", type=Path)
     parser.add_argument("--resume-run", type=Path)
-    parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
-    parser.add_argument("--query-limit", type=int, default=DEFAULT_QUERY_LIMIT)
-    parser.add_argument("--sql-editor-id", default=DEFAULT_SQL_EDITOR_ID)
-    parser.add_argument("--tab", default=DEFAULT_TAB)
-    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
-    parser.add_argument("--artifacts-dir", type=Path, default=DEFAULT_ARTIFACTS_DIR)
+    parser.add_argument("--page-size", type=int)
+    parser.add_argument("--query-limit", type=int)
+    parser.add_argument("--sql-editor-id")
+    parser.add_argument("--tab")
+    parser.add_argument("--workers", type=int)
+    parser.add_argument("--artifacts-dir", type=Path)
     parser.add_argument("--final-format", action="append", default=None, dest="final_format")
     parser.add_argument("--interactive", action="store_true")
     args = parser.parse_args(arguments)
-    if args.interactive or args.sql_file is None:
+    if args.interactive:
+        return None
+    if args.resume_run is not None:
+        return _build_resume_config(args)
+    if args.sql_file is None:
         return None
     final_formats = tuple(args.final_format) if args.final_format else DEFAULT_FINAL_FORMATS
-    return _build_config(args.base_url, args.database_id, args.schema, args.sql_file, args.page_size, args.query_limit, args.sql_editor_id, args.tab, args.workers, artifacts_dir=args.artifacts_dir, final_formats=final_formats, resume_run=args.resume_run)
+    return _build_config(args.base_url or DEFAULT_BASE_URL, args.database_id or DEFAULT_DATABASE_ID, args.schema or DEFAULT_SCHEMA, args.sql_file, args.page_size or DEFAULT_PAGE_SIZE, args.query_limit or DEFAULT_QUERY_LIMIT, args.sql_editor_id or DEFAULT_SQL_EDITOR_ID, args.tab or DEFAULT_TAB, args.workers or DEFAULT_WORKERS, artifacts_dir=args.artifacts_dir or DEFAULT_ARTIFACTS_DIR, final_formats=final_formats)
 
+
+def _build_resume_config(args: argparse.Namespace) -> Config:
+    manifest_path = args.resume_run / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Manifest resume tidak dapat dibaca") from error
+    stored = manifest.get("config")
+    if not isinstance(stored, dict):
+        if args.sql_file is None:
+            raise ValueError("Run lama belum menyimpan konfigurasi; gunakan --sql-file")
+        return _build_config(args.base_url or DEFAULT_BASE_URL, args.database_id or DEFAULT_DATABASE_ID, args.schema or DEFAULT_SCHEMA, args.sql_file, args.page_size or DEFAULT_PAGE_SIZE, args.query_limit or DEFAULT_QUERY_LIMIT, args.sql_editor_id or DEFAULT_SQL_EDITOR_ID, args.tab or DEFAULT_TAB, args.workers or DEFAULT_WORKERS, artifacts_dir=args.artifacts_dir or DEFAULT_ARTIFACTS_DIR, final_formats=tuple(args.final_format) if args.final_format else DEFAULT_FINAL_FORMATS, resume_run=args.resume_run)
+    query_file = args.resume_run / "query.sql"
+    if not query_file.is_file():
+        raise ValueError("query.sql tidak ditemukan pada run resume")
+    return _build_config(
+        str(stored["base_url"]), int(stored["database_id"]), str(stored["schema"]), query_file,
+        int(stored["page_size"]), int(stored["query_limit"]), str(stored["sql_editor_id"]), str(stored["tab"]),
+        args.workers if args.workers is not None else int(stored["workers"]),
+        artifacts_dir=args.artifacts_dir or DEFAULT_ARTIFACTS_DIR,
+        final_formats=tuple(args.final_format) if args.final_format else tuple(stored["final_formats"]),
+        resume_run=args.resume_run,
+    )
 
 def collect_config(input_value: Callable[[str], str] = input) -> Config:
     print("SQL Lab Extractor — tekan Enter untuk memakai nilai default.")

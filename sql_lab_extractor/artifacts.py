@@ -72,6 +72,20 @@ class RunStore:
         store._progress_path.touch()
         return store
 
+    def record_config(self, config: Any) -> None:
+        """Persist non-secret effective settings needed for short resume."""
+        self._update_manifest({"config": {
+            "base_url": config.base_url,
+            "database_id": config.database_id,
+            "schema": config.schema,
+            "page_size": config.page_size,
+            "query_limit": config.query_limit,
+            "sql_editor_id": config.sql_editor_id,
+            "tab": config.tab,
+            "workers": config.workers,
+            "final_formats": list(config.final_formats),
+        }})
+
     def append_event(self, event: dict[str, object]) -> None:
         """Append one redacted JSON object per line; serialized under one lock."""
         line = json.dumps(redact(event), ensure_ascii=False, separators=(",", ":")) + "\n"
