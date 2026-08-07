@@ -129,6 +129,26 @@ def _wait_for_page_slot(last_started_at: float | None, clock: Any = time.monoton
             sleep(remaining)
     return clock()
 
+RATE_LIMIT_RETRY_WAIT_SECONDS = 60.0
+
+
+def _rate_limit_type(error: HttpStatusError) -> str:
+    """Classify a 429 from the server response body.
+
+    Superset embeds the quota description (e.g. ``30 per 1 minute`` or
+    ``300 per 1 day``) in the error body; ``redact`` leaves the message text
+    intact because it is not a sensitive key, so we can read it back here.
+    """
+    diagnostic = getattr(error, "diagnostic", None) or {}
+    body = diagnostic.get("body") if isinstance(diagnostic, dict) else None
+    text = body if isinstance(body, str) else json.dumps(body or "")
+    lower = text.lower()
+    if "per 1 day" in lower or "per day" in lower or "daily" in lower:
+        return "per_day"
+    if "per 1 minute" in lower or "per minute" in lower or "minute" in lower:
+        return "per_minute"
+    return "unknown"
+
 
 def extract_run(
     config: Any,
@@ -147,6 +167,7 @@ def extract_run(
     records: dict[int, PageRecord] = {}
     outcomes: dict[int, str] = {}
     failed_offsets: set[int] = set()
+    rate_limited_offsets: set[int] = set()
     next_offset = 0
     evaluation_offset = 0
     empty_streak = 0
@@ -192,14 +213,20 @@ def extract_run(
                     failed_offsets.add(candidate)
                     outcomes[candidate] = "failed"
                     store.record_failure(candidate, 1, error)
-                    consecutive_failures += 1
                     last_error = error
                     if isinstance(error, HttpStatusError) and error.status_code == 429:
-                        fatal_error = error
-                        store.append_event({"event": "run_rate_limited", "offset": candidate, "status_code": 429})
-                        for pending in active:
-                            pending.cancel()
-                        break
+                        limit_type = _rate_limit_type(error)
+                        store.append_event({"event": "run_rate_limited", "offset": candidate, "status_code": 429, "limit": limit_type})
+                        if limit_type == "per_day":
+                            # Daily quota exhausted; cannot proceed until the next day.
+                            fatal_error = error
+                            for pending in active:
+                                pending.cancel()
+                            break
+                        # Per-minute (or unknown) rate limit: wait for the window to reset, then retry the offset.
+                        rate_limited_offsets.add(candidate)
+                        continue
+                    consecutive_failures += 1
                     continue
                 consecutive_failures = 0
                 record = store.write_page(candidate, rows)
@@ -226,8 +253,17 @@ def extract_run(
     retry_offsets = sorted(candidate for candidate in failed_offsets if candidate < terminal_offset)
     for candidate in retry_offsets:
         store.append_event({"event": "page_retry_started", "offset": candidate, "attempt": 2})
+        if candidate in rate_limited_offsets:
+            # Let the per-minute window reset before retrying so we do not re-trigger the 429.
+            time.sleep(RATE_LIMIT_RETRY_WAIT_SECONDS)
         try:
             record = store.write_page(candidate, _fetch_sync_page(candidate, config, sql, coordinator, make_client))
+        except HttpStatusError as error:
+            if error.status_code == 429 and _rate_limit_type(error) == "per_day":
+                store.append_event({"event": "run_rate_limited", "offset": candidate, "status_code": 429, "limit": "per_day", "attempt": 2})
+                raise
+            store.record_failure(candidate, 2, error)
+            continue
         except BaseException as error:
             store.record_failure(candidate, 2, error)
             continue

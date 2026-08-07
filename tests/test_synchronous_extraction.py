@@ -134,7 +134,7 @@ class SynchronousExtractionTests(unittest.TestCase):
         self.assertEqual([generation for generation, sql in calls if "OFFSET" in sql], [1, 1])
         self.assertEqual(coordinator.get_snapshot().generation, 1)
 
-    def test_stops_scheduling_after_rate_limit(self):
+    def test_stops_scheduling_after_daily_rate_limit(self):
         offsets = []
 
         class Client:
@@ -144,7 +144,7 @@ class SynchronousExtractionTests(unittest.TestCase):
                 if offset == 0:
                     time.sleep(0.05)
                     return {"status": "success", "data": [{"assignment_id": "0"}]}
-                raise HttpStatusError(429)
+                raise HttpStatusError(429, {"status_code": 429, "body": {"errors": [{"message": "Rate limit exceeded: 300 per 1 day"}]}})
 
         with tempfile.TemporaryDirectory() as directory, patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0):
             config = parse_args(["--sql-file", "q.sql", "--page-size", "1000", "--workers", "2", "--artifacts-dir", directory])
@@ -154,6 +154,38 @@ class SynchronousExtractionTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.status_code, 429)
         self.assertEqual(sorted(offsets), [0, 1000])
+
+    def test_waits_and_retries_after_minute_rate_limit(self):
+        from collections import defaultdict
+
+        attempts = defaultdict(int)
+
+        class Client:
+            def request(self, method, path, payload=None):
+                offset = int(re.search(r"OFFSET (\d+)$", payload["sql"]).group(1))
+                attempts[offset] += 1
+                if offset == 0 and attempts[offset] == 1:
+                    raise HttpStatusError(429, {"status_code": 429, "body": {"errors": [{"message": "Rate limit exceeded: 30 per 1 minute"}]}})
+                if offset >= 1000:
+                    return {"status": "success", "data": []}
+                return {"status": "success", "data": [{"assignment_id": str(offset)}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = parse_args(["--sql-file", "q.sql", "--page-size", "1000", "--workers", "2", "--artifacts-dir", directory])
+            coordinator = SessionCoordinator(refresh=lambda: BrowserSession("cookie", "csrf"))
+            with (
+                patch("sql_lab_extractor.__main__.PAGE_START_INTERVAL_SECONDS", 0),
+                patch("sql_lab_extractor.__main__.RATE_LIMIT_RETRY_WAIT_SECONDS", 0),
+            ):
+                records = extract_run(config, "SELECT assignment_id FROM sample ORDER BY assignment_id", coordinator, client_factory=lambda snapshot: Client())
+            self.assertEqual([record.offset for record in records], [0])
+            self.assertEqual(attempts[0], 2)
+            run_dir = next(Path(directory).iterdir())
+            events = [json.loads(line) for line in (run_dir / "progress.jsonl").read_text(encoding="utf-8").splitlines()]
+            rate_limited = [event for event in events if event.get("event") == "run_rate_limited"]
+            self.assertEqual(len(rate_limited), 1)
+            self.assertEqual(rate_limited[0]["limit"], "per_minute")
+            self.assertEqual(rate_limited[0]["offset"], 0)
 
     def test_pauses_refill_after_empty_page_until_window_resolves(self):
         offsets = []
